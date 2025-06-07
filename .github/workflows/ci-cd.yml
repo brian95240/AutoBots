@@ -1,0 +1,272 @@
+name: AutoBots CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '20'
+
+jobs:
+  test-backend:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: autobots_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Cache Python dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio pytest-cov
+    
+    - name: Set up environment variables
+      run: |
+        echo "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/autobots_test" >> $GITHUB_ENV
+        echo "REDIS_URL=redis://localhost:6379/1" >> $GITHUB_ENV
+        echo "SPIDER_API_KEY=test_key" >> $GITHUB_ENV
+        echo "SECRET_KEY=test_secret_key" >> $GITHUB_ENV
+    
+    - name: Run database migrations
+      run: |
+        python -c "
+        import asyncio
+        import asyncpg
+        async def setup_db():
+            conn = await asyncpg.connect('postgresql://postgres:postgres@localhost:5432/autobots_test')
+            with open('database/schema/init_schema.sql', 'r') as f:
+                await conn.execute(f.read())
+            await conn.close()
+        asyncio.run(setup_db())
+        "
+    
+    - name: Run backend tests
+      run: |
+        cd tests
+        python -m pytest test_autobots.py -v --cov=../core_bots --cov=../api --cov-report=xml
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./tests/coverage.xml
+        flags: backend
+        name: backend-coverage
+
+  test-frontend:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: autobots-dashboard/package-lock.json
+    
+    - name: Install frontend dependencies
+      run: |
+        cd autobots-dashboard
+        npm ci
+    
+    - name: Run frontend linting
+      run: |
+        cd autobots-dashboard
+        npm run lint
+    
+    - name: Run frontend tests
+      run: |
+        cd autobots-dashboard
+        npm run test -- --coverage --watchAll=false
+    
+    - name: Build frontend
+      run: |
+        cd autobots-dashboard
+        npm run build
+    
+    - name: Upload frontend build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: frontend-build
+        path: autobots-dashboard/dist/
+
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+    
+    - name: Python security scan with bandit
+      run: |
+        pip install bandit
+        bandit -r core_bots/ api/ -f json -o bandit-report.json || true
+    
+    - name: Upload security scan results
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          trivy-results.sarif
+          bandit-report.json
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-frontend, security-scan]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Download frontend build
+      uses: actions/download-artifact@v3
+      with:
+        name: frontend-build
+        path: autobots-dashboard/dist/
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_USERNAME }}/autobots:latest
+          ${{ secrets.DOCKER_USERNAME }}/autobots:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to staging
+      run: |
+        echo "Deploying to staging environment..."
+        # This would typically deploy to a staging server
+        # For now, we'll just echo the deployment command
+        echo "docker run -d --name autobots-staging -p 8080:5000 ${{ secrets.DOCKER_USERNAME }}/autobots:${{ github.sha }}"
+    
+    - name: Run integration tests
+      run: |
+        echo "Running integration tests against staging..."
+        # This would run integration tests against the staging deployment
+        sleep 30  # Wait for deployment to be ready
+        curl -f http://staging.autobots.com/api/health || exit 1
+    
+    - name: Notify deployment status
+      run: |
+        echo "Staging deployment completed successfully"
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to production
+      run: |
+        echo "Deploying to production environment..."
+        # This would typically deploy to production servers
+        # For now, we'll just echo the deployment command
+        echo "docker run -d --name autobots-prod -p 80:5000 ${{ secrets.DOCKER_USERNAME }}/autobots:${{ github.sha }}"
+    
+    - name: Run smoke tests
+      run: |
+        echo "Running smoke tests against production..."
+        # This would run smoke tests against the production deployment
+        sleep 30  # Wait for deployment to be ready
+        curl -f http://autobots.com/api/health || exit 1
+    
+    - name: Notify deployment status
+      run: |
+        echo "Production deployment completed successfully"
+        # This would typically send notifications to Slack, email, etc.
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+    
+    steps:
+    - name: Clean up old Docker images
+      run: |
+        echo "Cleaning up old Docker images..."
+        # This would clean up old images to save space
+        echo "docker image prune -f"
+    
+    - name: Update deployment status
+      run: |
+        echo "Pipeline completed"
+        # This would update deployment status in monitoring systems
+

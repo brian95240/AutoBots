@@ -1,0 +1,212 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database (for local development)
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: autobots_postgres
+    environment:
+      POSTGRES_DB: autobots
+      POSTGRES_USER: autobots_user
+      POSTGRES_PASSWORD: autobots_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema/init_schema.sql:/docker-entrypoint-initdb.d/01-init.sql
+    networks:
+      - autobots_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autobots_user -d autobots"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # pgBouncer for connection pooling
+  pgbouncer:
+    image: pgbouncer/pgbouncer:latest
+    container_name: autobots_pgbouncer
+    environment:
+      DATABASES_HOST: postgres
+      DATABASES_PORT: 5432
+      DATABASES_USER: autobots_user
+      DATABASES_PASSWORD: autobots_password
+      DATABASES_DBNAME: autobots
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 100
+      DEFAULT_POOL_SIZE: 20
+    ports:
+      - "6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - autobots_network
+    volumes:
+      - ./infrastructure/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini
+
+  # Redis for caching and session management
+  redis:
+    image: redis:7-alpine
+    container_name: autobots_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - autobots_network
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+  # AutoBots API Service
+  autobots_api:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.api
+    container_name: autobots_api
+    environment:
+      - DATABASE_URL=postgresql://autobots_user:autobots_password@pgbouncer:5432/autobots
+      - REDIS_URL=redis://redis:6379/0
+      - SPIDER_API_KEY=${SPIDER_API_KEY}
+      - SECRET_KEY=${SECRET_KEY}
+      - ENVIRONMENT=development
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - pgbouncer
+      - redis
+    networks:
+      - autobots_network
+    volumes:
+      - ./api:/app/api
+      - ./core_bots:/app/core_bots
+    restart: unless-stopped
+
+  # ScoutBot Service
+  scoutbot:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.scoutbot
+    container_name: autobots_scoutbot
+    environment:
+      - DATABASE_URL=postgresql://autobots_user:autobots_password@pgbouncer:5432/autobots
+      - SPIDER_API_KEY=${SPIDER_API_KEY}
+      - REDIS_URL=redis://redis:6379/1
+    depends_on:
+      - postgres
+      - pgbouncer
+      - redis
+    networks:
+      - autobots_network
+    volumes:
+      - ./core_bots:/app/core_bots
+    restart: unless-stopped
+
+  # SentinelBot Service
+  sentinelbot:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.sentinelbot
+    container_name: autobots_sentinelbot
+    environment:
+      - DATABASE_URL=postgresql://autobots_user:autobots_password@pgbouncer:5432/autobots
+      - SPIDER_API_KEY=${SPIDER_API_KEY}
+      - REDIS_URL=redis://redis:6379/2
+    depends_on:
+      - postgres
+      - pgbouncer
+      - redis
+    networks:
+      - autobots_network
+    volumes:
+      - ./core_bots:/app/core_bots
+    restart: unless-stopped
+
+  # Frontend Dashboard
+  autobots_frontend:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/Dockerfile.frontend
+    container_name: autobots_frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_ENVIRONMENT=development
+    ports:
+      - "3000:3000"
+    depends_on:
+      - autobots_api
+    networks:
+      - autobots_network
+    volumes:
+      - ./frontend:/app/frontend
+      - /app/frontend/node_modules
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: autobots_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./infrastructure/nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - autobots_api
+      - autobots_frontend
+    networks:
+      - autobots_network
+    restart: unless-stopped
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: autobots_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - autobots_network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: autobots_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/monitoring/grafana:/etc/grafana/provisioning
+    networks:
+      - autobots_network
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  autobots_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
