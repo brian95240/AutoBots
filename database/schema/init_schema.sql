@@ -1,11 +1,75 @@
 -- AutoBots Database Schema SQL
--- PostgreSQL 15 with TimescaleDB for time-series optimization
--- Implements time-based partitioning and GDPR compliance
+-- PostgreSQL 17 optimized for Neon serverless
+-- Implements GDPR compliance and performance optimization
 
--- Enable required extensions
-CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+-- Enable required extensions (compatible with Neon)
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
-CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- Bot configurations table for system settings
+CREATE TABLE IF NOT EXISTS bot_configs (
+    id BIGSERIAL PRIMARY KEY,
+    bot_name VARCHAR(50) UNIQUE NOT NULL,
+    config_data JSONB NOT NULL DEFAULT '{}',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- System settings table for global configuration
+CREATE TABLE IF NOT EXISTS system_settings (
+    id BIGSERIAL PRIMARY KEY,
+    setting_key VARCHAR(100) UNIQUE NOT NULL,
+    setting_value TEXT NOT NULL,
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Bot logs table for monitoring and debugging
+CREATE TABLE IF NOT EXISTS bot_logs (
+    id BIGSERIAL PRIMARY KEY,
+    bot_name VARCHAR(50) NOT NULL,
+    level VARCHAR(20) NOT NULL CHECK (level IN ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')),
+    message TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}',
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- System metrics table for performance monitoring
+CREATE TABLE IF NOT EXISTS system_metrics (
+    id BIGSERIAL PRIMARY KEY,
+    metric_name VARCHAR(100) NOT NULL,
+    metric_value DECIMAL(15,4) NOT NULL,
+    metric_unit VARCHAR(20),
+    tags JSONB DEFAULT '{}',
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Threat detections table for SentinelBot
+CREATE TABLE IF NOT EXISTS threat_detections (
+    id BIGSERIAL PRIMARY KEY,
+    threat_id VARCHAR(100) UNIQUE NOT NULL,
+    threat_type VARCHAR(50) NOT NULL,
+    threat_level VARCHAR(20) NOT NULL CHECK (threat_level IN ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')),
+    source_data JSONB NOT NULL,
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    resolution_notes TEXT,
+    false_positive BOOLEAN DEFAULT FALSE
+);
+
+-- Vendor operations table for OperatorBot
+CREATE TABLE IF NOT EXISTS vendor_operations (
+    id BIGSERIAL PRIMARY KEY,
+    vendor_name VARCHAR(100) NOT NULL,
+    operation_type VARCHAR(50) NOT NULL,
+    operation_data JSONB NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    error_details TEXT,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- Products table with time-based partitioning for ScoutBot
 CREATE TABLE IF NOT EXISTS products (
@@ -33,11 +97,10 @@ CREATE TABLE IF NOT EXISTS products_2025_07 PARTITION OF products
     FOR VALUES FROM ('2025-07-01') TO ('2025-08-01');
 CREATE TABLE IF NOT EXISTS products_2025_08 PARTITION OF products
     FOR VALUES FROM ('2025-08-01') TO ('2025-09-01');
-
 -- Threats table for SentinelBot real-time detection
 CREATE TABLE IF NOT EXISTS threats (
     id BIGSERIAL PRIMARY KEY,
-    threat_type VARCHAR(50) NOT NULL,
+    threat_type VARCHAR(100) NOT NULL,
     severity_level INTEGER CHECK (severity_level BETWEEN 1 AND 10),
     source_ip INET,
     user_agent TEXT,
@@ -49,9 +112,6 @@ CREATE TABLE IF NOT EXISTS threats (
     status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'resolved', 'false_positive')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- Convert to hypertable for time-series optimization
-SELECT create_hypertable('threats', 'detection_time', if_not_exists => TRUE);
 
 -- Affiliates table for AffiliateBot GDPR compliance
 CREATE TABLE IF NOT EXISTS affiliates (
@@ -67,7 +127,7 @@ CREATE TABLE IF NOT EXISTS affiliates (
     status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'terminated')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    gdpr_purge_date TIMESTAMPTZ GENERATED ALWAYS AS (created_at + INTERVAL '30 days') STORED
+    gdpr_purge_date TIMESTAMPTZ
 );
 
 -- Operations table for OperatorBot and ArchitectBot
@@ -110,8 +170,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ip_address INET
 );
 
--- Convert to hypertable for efficient log storage
-SELECT create_hypertable('audit_log', 'timestamp', if_not_exists => TRUE);
+-- Create indexes for audit log performance
+CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_log_table_name ON audit_log(table_name);
+CREATE INDEX IF NOT EXISTS idx_audit_log_operation ON audit_log(operation);
 
 -- Create optimized indexes for performance
 -- Products table indexes
@@ -211,37 +273,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Schedule automatic tasks (requires pg_cron extension)
--- Refresh materialized views every 5 minutes
-SELECT cron.schedule('refresh-views', '*/5 * * * *', 'SELECT refresh_materialized_views();');
-
--- GDPR data purge daily at 2 AM
-SELECT cron.schedule('gdpr-purge', '0 2 * * *', 'SELECT purge_expired_gdpr_data();');
-
--- Create partition maintenance function
-CREATE OR REPLACE FUNCTION maintain_partitions()
-RETURNS void AS $$
-DECLARE
-    next_month_start DATE;
-    next_month_end DATE;
-    partition_name TEXT;
-BEGIN
-    -- Calculate next month dates
-    next_month_start := DATE_TRUNC('month', NOW() + INTERVAL '2 months');
-    next_month_end := next_month_start + INTERVAL '1 month';
-    
-    -- Generate partition name
-    partition_name := 'products_' || TO_CHAR(next_month_start, 'YYYY_MM');
-    
-    -- Create partition if it doesn't exist
-    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF products FOR VALUES FROM (%L) TO (%L)',
-                   partition_name, next_month_start, next_month_end);
-END;
-$$ LANGUAGE plpgsql;
-
--- Schedule partition maintenance monthly
-SELECT cron.schedule('partition-maintenance', '0 0 1 * *', 'SELECT maintain_partitions();');
-
 -- Insert sample data for testing
 INSERT INTO users (username, email, password_hash, role) VALUES
 ('admin', 'admin@autobots.com', '$2b$12$example_hash', 'admin'),
@@ -253,12 +284,6 @@ INSERT INTO affiliates (affiliate_id, company_name, contact_email, disclosure_te
 ('AFF002', 'Test Marketing LLC', 'info@testmarketing.com', 'Disclosure: We earn commissions from qualifying purchases.', 0.03)
 ON CONFLICT (affiliate_id) DO NOTHING;
 
--- Performance optimization settings
--- Enable parallel query execution
-SET max_parallel_workers_per_gather = 4;
-SET max_parallel_workers = 8;
-
--- Optimize for time-series workloads
-SET shared_preload_libraries = 'timescaledb, pg_stat_statements';
-SET timescaledb.max_background_workers = 8;
+-- Performance optimization settings (Neon managed)
+-- Note: Many settings are automatically optimized by Neon
 
